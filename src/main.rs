@@ -35,7 +35,7 @@ Usage: fingerprint-disabler.exe [command]
   uninstall      remove the service, re-enable devices (admin)
   start          start the service (admin)
   list           list biometric devices
-  check-update   check GitHub for a newer release
+  check-update   check GitHub for a newer release (--download: also fetch + verify)
   --console      run the worker in the foreground for testing (admin)
 ";
 
@@ -60,7 +60,18 @@ fn main() {
             unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
             println!();
             match updater::check() {
-                Ok(Some(u)) => println!("Update available: {} ({})", u.version, u.asset_url),
+                Ok(Some(u)) => {
+                    println!("Update available: {} ({})", u.version, u.asset_url);
+                    if args.iter().any(|a| a == "--download") {
+                        match updater::download(&u) {
+                            Ok(p) => println!("Downloaded and SHA-256 verified: {}", p.display()),
+                            Err(e) => {
+                                eprintln!("Download failed: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
                 Ok(None) => println!("Up to date ({}).", updater::VERSION),
                 Err(e) => {
                     eprintln!("Update check failed: {e}");
