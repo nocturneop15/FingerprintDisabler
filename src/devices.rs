@@ -6,6 +6,9 @@ use std::{io, mem, ptr};
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::*;
 use windows_sys::core::GUID;
 
+/// Problem code of a device whose change Windows finishes after a restart.
+pub use windows_sys::Win32::Devices::DeviceAndDriverInstallation::CM_PROB_NEED_RESTART;
+
 /// {53D29EF7-377C-4D14-864B-EB3A85769359} - Biometric devices class.
 pub const GUID_DEVCLASS_BIOMETRIC: GUID = GUID::from_u128(0x53d29ef7_377c_4d14_864b_eb3a85769359);
 
@@ -16,6 +19,9 @@ pub struct BioDevice {
     pub disabled: bool,
     /// Device has some other problem (driver error etc.).
     pub problem: u32,
+    /// False if Windows could not report the device's status. `disabled`
+    /// and `problem` are then meaningless: treat the state as unknown.
+    pub status_known: bool,
 }
 
 struct DevInfoSet(HDEVINFO);
@@ -86,9 +92,10 @@ impl DevInfoSet {
             .unwrap_or_else(|| instance_id.clone());
         let (mut status, mut problem) = (0u32, 0u32);
         let cr = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, data.DevInst, 0) };
-        let has_problem = cr == CR_SUCCESS && (status & DN_HAS_PROBLEM) != 0;
+        let status_known = cr == CR_SUCCESS;
+        let has_problem = status_known && (status & DN_HAS_PROBLEM) != 0;
         let disabled = has_problem && problem == CM_PROB_DISABLED;
-        BioDevice { instance_id, name, disabled, problem: if has_problem { problem } else { 0 } }
+        BioDevice { instance_id, name, disabled, problem: if has_problem { problem } else { 0 }, status_known }
     }
 }
 

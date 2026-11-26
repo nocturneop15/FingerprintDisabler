@@ -101,6 +101,13 @@ pub fn message_box(text: &str, error: bool) {
     unsafe { MessageBoxW(ptr::null_mut(), t.as_ptr(), c.as_ptr(), flags | MB_OK | MB_SETFOREGROUND) };
 }
 
+pub fn ask_yes_no(text: &str) -> bool {
+    let t = wide(text);
+    let c = wide("Fingerprint Disabler");
+    let flags = MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND;
+    unsafe { MessageBoxW(ptr::null_mut(), t.as_ptr(), c.as_ptr(), flags) == IDYES }
+}
+
 // --------------------------------------------------------------- startup --
 
 pub fn run(updated: bool) {
@@ -526,14 +533,26 @@ fn prompt_update(hwnd: HWND) {
     UPDATE_BUSY.set(true);
     let hwnd = hwnd as isize;
     std::thread::spawn(move || {
-        let msg = match updater::download(&info) {
-            Err(e) => UpdateMsg::InstallFailed(Some(format!("Update download failed:\n{e}"))),
-            Ok(exe) => match run_elevated_wait(&exe.display().to_string(), "install --gui --update") {
-                Some(0) => UpdateMsg::Installed,
-                // Failure details were already shown by the elevated installer;
-                // None = UAC prompt cancelled.
-                _ => UpdateMsg::InstallFailed(None),
-            },
+        // The installed copy (admin-only directory) downloads, verifies and
+        // installs the update itself; nothing this process writes is run
+        // elevated.
+        let msg = match verified_installed_exe() {
+            Err(_) if !install_dir().join(EXE_NAME).exists() => UpdateMsg::InstallFailed(Some(format!(
+                "The service is not installed, so there is nothing to update.\n\nDownload version {} from {}",
+                info.version, info.html_url
+            ))),
+            Err(e) => UpdateMsg::InstallFailed(Some(format!(
+                "Refusing to run the installed program as administrator:\n{e}\n\nReinstall Fingerprint Disabler."
+            ))),
+            Ok(installed) => {
+                let args = format!("update --gui --version \"{}\"", info.version);
+                match run_elevated_wait(&installed.display().to_string(), &args) {
+                    Some(0) => UpdateMsg::Installed,
+                    // Failure details were already shown by the elevated updater;
+                    // None = UAC prompt cancelled.
+                    _ => UpdateMsg::InstallFailed(None),
+                }
+            }
         };
         post_update(msg, hwnd);
     });

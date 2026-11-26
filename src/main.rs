@@ -9,6 +9,7 @@
 //!   fingerprint-disabler.exe install      install/update service + autostart (admin)
 //!   fingerprint-disabler.exe uninstall    remove everything, re-enable devices (admin)
 //!   fingerprint-disabler.exe start        start the service (admin)
+//!   fingerprint-disabler.exe update       download, verify and install the latest release (admin)
 //!   fingerprint-disabler.exe list         list biometric devices
 //!   fingerprint-disabler.exe check-update check GitHub releases for a newer version
 //!   fingerprint-disabler.exe --console    run the worker in a console window (admin, testing)
@@ -21,6 +22,7 @@ mod devices;
 mod install;
 mod service;
 mod tray;
+mod trust;
 mod updater;
 
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AllocConsole, AttachConsole};
@@ -32,7 +34,9 @@ Usage: fingerprint-disabler.exe [command]
 
   (no command)   tray icon + settings window
   install        install/update the service and tray autostart (admin)
-  uninstall      remove the service, re-enable devices (admin)
+  uninstall      remove the service, re-enable devices (admin; --force: even if
+                 some devices could not be re-enabled)
+  update         download, verify and install the latest release (admin)
   start          start the service (admin)
   list           list biometric devices
   check-update   check GitHub for a newer release (--download: also fetch + verify)
@@ -50,11 +54,11 @@ fn main() {
             unsafe { AllocConsole() };
             service::run_console();
         }
-        Some(cmd @ ("install" | "uninstall" | "start")) => {
+        Some(cmd @ ("install" | "uninstall" | "start" | "update")) => {
             if !gui {
                 unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
             }
-            std::process::exit(install::run(cmd, gui, args.iter().any(|a| a == "--update")));
+            std::process::exit(install::run(cmd, &args));
         }
         Some("check-update") => {
             unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
@@ -86,7 +90,7 @@ fn main() {
                 Ok(list) if list.is_empty() => println!("No biometric devices found."),
                 Ok(list) => {
                     for d in list {
-                        let state = if d.disabled { "DISABLED" } else if d.problem != 0 { "PROBLEM" } else { "enabled" };
+                        let state = if !d.status_known { "UNKNOWN" } else if d.disabled { "DISABLED" } else if d.problem != 0 { "PROBLEM" } else { "enabled" };
                         println!("{:<9} {}\n          {}", state, d.name, d.instance_id);
                     }
                 }

@@ -7,9 +7,10 @@
 //! (e.g. if Windows or a driver update re-enabled a device while docked).
 
 use crate::common::*;
-use crate::devices;
+use crate::devices::{self, CM_PROB_NEED_RESTART};
+use crate::trust;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsString,
     os::windows::io::AsRawHandle,
     sync::{
@@ -58,7 +59,6 @@ fn service_main(_args: Vec<OsString>) {
 }
 
 fn run_as_service() -> windows_service::Result<()> {
-    let _ = std::fs::create_dir_all(data_dir());
     let (tx, rx) = mpsc::channel::<Event>();
 
     let handler = move |ctrl: ServiceControl| -> ServiceControlHandlerResult {
@@ -93,6 +93,25 @@ fn run_as_service() -> windows_service::Result<()> {
     };
 
     let status_handle = service_control_handler::register(SERVICE_NAME, handler)?;
+
+    // Nothing is read, written or changed (no log file, no devices) unless
+    // the data directory is trusted. Held open for the service's lifetime.
+    let _dir = match trust::trusted_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            trust::report_error(&format!("Fingerprint Disabler service not started: {e}"));
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::ServiceSpecific(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            });
+            return Ok(());
+        }
+    };
     let set_state = |state: ServiceState, accept: ServiceControlAccept| {
         let _ = status_handle.set_service_status(ServiceStatus {
             service_type: ServiceType::OWN_PROCESS,
@@ -147,7 +166,13 @@ fn console_send(ev: Event) {
 pub fn run_console() {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
-    let _ = std::fs::create_dir_all(data_dir());
+    let _dir = match trust::trusted_data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            trust::report_error(&format!("Not started: {e}"));
+            return;
+        }
+    };
     let (tx, rx) = mpsc::channel::<Event>();
     let _ = CONSOLE_TX.set(Mutex::new(tx));
 
@@ -221,7 +246,12 @@ fn config_mtime() -> Option<SystemTime> {
 struct Worker {
     cfg: Config,
     cfg_mtime: Option<SystemTime>,
+    /// What `state.json` currently holds. Only valid when `state_loaded`.
     state: State,
+    state_loaded: bool,
+    /// Owned devices whose re-enable Windows completes only after a restart
+    /// -> boot in which that was reported. Persisted in `state.json`.
+    reboot_pending: BTreeMap<String, BootMarker>,
     lid_closed: Option<bool>,
     /// Last error per device, so repeated failures are logged once.
     errors: HashMap<String, String>,
@@ -234,7 +264,9 @@ fn worker(rx: Receiver<Event>) {
     let mut w = Worker {
         cfg: load_config(),
         cfg_mtime: config_mtime(),
-        state: load_state(),
+        state: State::default(),
+        state_loaded: false,
+        reboot_pending: BTreeMap::new(),
         lid_closed: None,
         errors: HashMap::new(),
         last_status: None,
@@ -251,7 +283,15 @@ fn worker(rx: Receiver<Event>) {
             Ok(Event::Stop { restore }) => {
                 if restore {
                     log("stopping: re-enabling devices disabled by this service");
-                    w.reconcile(&BTreeSet::new());
+                    if w.ensure_state() {
+                        w.reconcile(&BTreeSet::new());
+                    }
+                    if !w.state.owned.is_empty() {
+                        log(format!(
+                            "stopped with devices still disabled (kept in state.json for recovery): {:?}",
+                            w.state.owned
+                        ));
+                    }
                 } else {
                     log("system shutdown: keeping current device state");
                 }
@@ -287,6 +327,12 @@ impl Worker {
             }
         }
 
+        // Ownership record unreadable: touching devices could lose track of
+        // them, so wait until it can be read.
+        if !self.ensure_state() {
+            self.publish(true);
+            return;
+        }
         match self.lid_closed {
             // Lid state not known yet: don't touch anything.
             None => {}
@@ -302,8 +348,79 @@ impl Worker {
         self.publish(true);
     }
 
+    /// Loads `state.json` once. Returns false while it cannot be read (the
+    /// caller must not touch devices then). A corrupt file is moved aside so
+    /// its contents stay available for manual recovery.
+    fn ensure_state(&mut self) -> bool {
+        if self.state_loaded {
+            return true;
+        }
+        match load_state() {
+            Ok(st) => {
+                self.reboot_pending = st.reboot_pending.iter().map(|(k, v)| (k.to_uppercase(), v.clone())).collect();
+                self.state = st;
+                self.state_loaded = true;
+                self.errors.remove("state");
+                true
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let secs = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let bad = state_path().with_extension(format!("json.bad-{secs}"));
+                if let Err(m) = std::fs::rename(state_path(), &bad) {
+                    // Carrying on would let the next save overwrite the only
+                    // copy of the record, so stay hands-off until it is moved.
+                    self.note_error(
+                        "state",
+                        format!("state.json is corrupt ({e}) and cannot be moved aside ({m}); not changing any device"),
+                    );
+                    return false;
+                }
+                self.note_error(
+                    "state",
+                    format!(
+                        "state.json was corrupt ({e}); kept as {} - devices listed there may need to be re-enabled in Device Manager",
+                        bad.display()
+                    ),
+                );
+                self.state = State::default();
+                self.state_loaded = true;
+                true
+            }
+            Err(e) => {
+                self.note_error("state", format!("cannot read state.json ({e}); not changing any device until it can be read"));
+                false
+            }
+        }
+    }
+
+    /// Writes the ownership set to `state.json` if it changed.
+    fn persist(&mut self, owned: &BTreeSet<String>) -> std::io::Result<()> {
+        let st = State {
+            owned: owned.iter().cloned().collect(),
+            reboot_pending: self
+                .reboot_pending
+                .iter()
+                .filter(|(id, _)| owned.contains(*id))
+                .map(|(id, b)| (id.clone(), b.clone()))
+                .collect(),
+        };
+        if st == self.state {
+            return Ok(());
+        }
+        save_state(&st)?;
+        self.state = st;
+        Ok(())
+    }
+
     /// Makes the devices in `desired` disabled; re-enables every device the
     /// service disabled earlier that is not in `desired`.
+    ///
+    /// Ownership is recorded durably *before* a device is disabled, so a
+    /// crash or failed write can never leave a disabled device that the
+    /// service does not know it has to re-enable.
     fn reconcile(&mut self, desired: &BTreeSet<String>) {
         let devs = match devices::enumerate() {
             Ok(d) => d,
@@ -315,45 +432,76 @@ impl Worker {
         self.errors.remove("enumerate");
         self.names = devs.iter().map(|d| (d.instance_id.to_uppercase(), d.name.clone())).collect();
         let mut owned: BTreeSet<String> = self.state.owned.iter().map(|s| s.to_uppercase()).collect();
-        let before = owned.clone();
 
         for d in &devs {
             let id = d.instance_id.to_uppercase();
+            if !d.status_known {
+                // Can't tell whether it is enabled: change nothing, and keep
+                // any ownership record as it is.
+                self.note_error(&id, format!("cannot read the status of '{}'; leaving it alone", d.name));
+                continue;
+            }
             if desired.contains(&id) {
                 if !d.disabled {
+                    if owned.insert(id.clone())
+                        && let Err(e) = self.persist(&owned)
+                    {
+                        owned.remove(&id);
+                        self.note_error(&id, format!("not disabling '{}': cannot save state.json: {e}", d.name));
+                        continue;
+                    }
+                    self.reboot_pending.remove(&id);
                     match devices::set_enabled(&d.instance_id, false) {
                         Ok(reboot) => {
                             log(format!("disabled '{}' [{}]{}", d.name, d.instance_id,
                                 if reboot { " (reboot required!)" } else { "" }));
-                            owned.insert(id.clone());
                             self.errors.remove(&id);
                         }
+                        // Stays owned: if the disable partly took effect it
+                        // still gets re-enabled; if not, the next pass drops it.
                         Err(e) => self.note_error(&id, format!("cannot disable '{}': {e}", d.name)),
                     }
                 }
             } else if owned.contains(&id) {
-                if d.disabled {
+                let restart_pending = self.reboot_pending.get(&id).is_some_and(BootMarker::restart_outstanding)
+                    || d.problem == CM_PROB_NEED_RESTART;
+                if restart_pending && (d.disabled || d.problem == CM_PROB_NEED_RESTART) {
+                    // Enabled, but Windows finishes it only after a restart:
+                    // keep the record until the device is really back.
+                    self.note_error(&id, format!("Windows must restart to finish re-enabling '{}'", d.name));
+                } else if d.disabled {
                     match devices::set_enabled(&d.instance_id, true) {
-                        Ok(reboot) => {
-                            log(format!("enabled '{}' [{}]{}", d.name, d.instance_id,
-                                if reboot { " (reboot required!)" } else { "" }));
+                        Ok(false) => {
+                            log(format!("enabled '{}' [{}]", d.name, d.instance_id));
                             owned.remove(&id);
                             self.errors.remove(&id);
+                        }
+                        Ok(true) => {
+                            log(format!("enabled '{}' [{}] (Windows restart required to finish)", d.name, d.instance_id));
+                            self.reboot_pending.insert(id.clone(), BootMarker::current());
+                            self.note_error(&id, format!("Windows must restart to finish re-enabling '{}'", d.name));
                         }
                         Err(e) => self.note_error(&id, format!("cannot enable '{}': {e}", d.name)),
                     }
                 } else {
-                    // Someone else already re-enabled it.
+                    // Working again (re-enabled by someone else, or the
+                    // restart happened).
                     owned.remove(&id);
+                    self.reboot_pending.remove(&id);
+                    self.errors.remove(&id);
                 }
             }
         }
         // Owned devices that are not present (unplugged) stay in the set so
         // they get re-enabled when they show up again.
 
-        if owned != before {
-            self.state.owned = owned.into_iter().collect();
-            save_state(&self.state);
+        // Only removals are left to save here; if this fails the on-disk
+        // record still lists them and the next pass retries.
+        match self.persist(&owned) {
+            Ok(()) => {
+                self.errors.remove("state-save");
+            }
+            Err(e) => self.note_error("state-save", format!("cannot save state.json: {e}")),
         }
     }
 
@@ -388,7 +536,7 @@ impl Worker {
         };
         if self.last_status.as_ref() != Some(&status) {
             if let Ok(json) = serde_json::to_string_pretty(&status) {
-                let _ = std::fs::write(status_path(), json);
+                let _ = write_atomic(&status_path(), json.as_bytes());
             }
             self.last_status = Some(status);
         }

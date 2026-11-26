@@ -2,7 +2,10 @@
 //!
 //! The latest release must contain an asset named `fingerprint-disabler.exe`.
 //! GitHub publishes a `sha256:` digest for every release asset; the downloaded
-//! file must match it before it is executed.
+//! file must match it before it is executed. The tray only *checks*; the
+//! elevated `update` command downloads, verifies and stages the file itself in
+//! the admin-only install directory, so no user-writable file is ever run
+//! with administrator rights.
 
 use crate::common::{EXE_NAME, wide};
 use serde::Deserialize;
@@ -84,13 +87,27 @@ pub fn check() -> Result<Option<UpdateInfo>, String> {
     }))
 }
 
-/// Downloads and verifies the update; returns the path of the new exe.
-pub fn download(info: &UpdateInfo) -> Result<PathBuf, String> {
+/// Downloads the release asset and checks it against the published SHA-256.
+/// Returns the verified bytes; the caller decides where they may be written.
+pub fn fetch_verified(info: &UpdateInfo) -> Result<Vec<u8>, String> {
     let data = http_get(&info.asset_url, None)?;
-    let actual = sha256_hex(&data)?;
-    if actual != info.sha256 {
-        return Err(format!("checksum mismatch (expected {}, got {actual})", info.sha256));
+    verify(&data, &info.sha256)?;
+    Ok(data)
+}
+
+pub fn verify(data: &[u8], expected_sha256: &str) -> Result<(), String> {
+    let actual = sha256_hex(data)?;
+    if actual != expected_sha256 {
+        return Err(format!("checksum mismatch (expected {expected_sha256}, got {actual})"));
     }
+    Ok(())
+}
+
+/// Downloads and verifies the update into the user's local app data and
+/// returns its path. For `check-update --download` testing only: the file is
+/// user-writable, so it must never be what an elevated process runs.
+pub fn download(info: &UpdateInfo) -> Result<PathBuf, String> {
+    let data = fetch_verified(info)?;
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let dir = base.join("FingerprintDisabler").join("update");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
